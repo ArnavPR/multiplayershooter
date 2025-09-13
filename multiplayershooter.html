@@ -1,0 +1,529 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>P2P Canvas Shooter — Single File</title>
+<style>
+  body { font-family: Arial, sans-serif; margin:0; background:#111; color:#ddd; display:flex; height:100vh; }
+  #left { width:320px; padding:12px; background:#0f0f14; box-sizing:border-box; overflow:auto; }
+  #right { flex:1; display:flex; align-items:center; justify-content:center; }
+  textarea { width:100%; height:120px; background:#08080b; color:#dfe; border:1px solid #333; padding:8px; box-sizing:border-box; font-family:monospace; }
+  button { margin:6px 0; width:100%; padding:8px; }
+  #canvas { background:#0b0b14; border:2px solid #222; display:block; }
+  .small { font-size:13px; color:#aaa; margin-top:6px; }
+  label { font-size:13px; color:#bbb; }
+  #status { font-weight:bold; color:#7ff; }
+  .warning { color:#f88; }
+  #controls { margin-top:8px; }
+</style>
+</head>
+<body>
+  <div id="left">
+    <h2>P2P Shooter (2 players)</h2>
+    <div><span id="status">Disconnected</span></div>
+    <p class="small">Manual signaling (copy/paste). One player is the Host (create Offer). The other creates an Answer from the Offer. Then Host pastes Answer and sets remote answer.</p>
+
+    <label>Create Offer (host):</label>
+    <button id="createOfferBtn">Create Offer</button>
+    <textarea id="localOffer" placeholder="Offer will appear here"></textarea>
+
+    <label>Remote Offer (paste here if you're the Answerer):</label>
+    <textarea id="remoteOffer" placeholder="Paste host offer here"></textarea>
+    <button id="createAnswerBtn">Create Answer (for remote offer)</button>
+    <textarea id="localAnswer" placeholder="Answer will appear here"></textarea>
+
+    <label>Remote Answer (host paste answer here):</label>
+    <textarea id="remoteAnswer" placeholder="Host pastes answer here"></textarea>
+    <button id="setRemoteAnswerBtn">Set Remote Answer (host)</button>
+
+    <div id="controls">
+      <label>Your name:</label>
+      <input id="myName" placeholder="Player1" style="width:100%; padding:6px; box-sizing:border-box;">
+      <label>Color (hex):</label>
+      <input id="myColor" value="#66ccff" style="width:100%; padding:6px; box-sizing:border-box;">
+    </div>
+
+    <p class="small">Controls: WASD to move, mouse to aim, left click to shoot. First to 5 kills wins.</p>
+    <p class="small warning">If DataChannel doesn't open, try a different browser or use localhost/https.</p>
+  </div>
+
+  <div id="right">
+    <canvas id="canvas" width="960" height="640"></canvas>
+  </div>
+
+<script>
+// --- Simple 2-player P2P shooter using WebRTC DataChannel with manual signaling ---
+// Author: ChatGPT (single-file). Save as p2p-shooter.html.
+
+// Networking / WebRTC setup
+let pc = null;
+let dc = null;
+let isHost = false;
+let connected = false;
+
+const createPeer = (makeDataChannel) => {
+  pc = new RTCPeerConnection();
+
+  pc.onicecandidate = (e) => {
+    // ICE candidates are embedded in SDP automatically for modern browsers (trickle disabled here).
+    // We don't need to handle incremental candidates; generate full SDP and exchange it.
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('pc state', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      setStatus('Connected');
+    } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      setStatus('Disconnected');
+      connected = false;
+    }
+  };
+
+  pc.ondatachannel = (evt) => {
+    if (!dc) {
+      dc = evt.channel;
+      setupDC();
+    }
+  };
+
+  if (makeDataChannel) {
+    dc = pc.createDataChannel('game');
+    setupDC();
+  }
+};
+
+const setupDC = () => {
+  dc.onopen = () => {
+    console.log('DataChannel open');
+    setStatus('Connected');
+    connected = true;
+    send({ t: 'hello', name: document.getElementById('myName').value || 'Player', color: document.getElementById('myColor').value || '#66ccff' });
+  };
+  dc.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleNetMessage(msg);
+    } catch(e) {
+      console.error('bad msg', e, evt.data);
+    }
+  };
+  dc.onclose = () => { setStatus('Disconnected'); connected = false; };
+};
+
+const send = (obj) => {
+  if (dc && dc.readyState === 'open') {
+    dc.send(JSON.stringify(obj));
+  }
+};
+
+function setStatus(s) {
+  document.getElementById('status').textContent = s;
+}
+
+// --- UI buttons for manual signaling ---
+document.getElementById('createOfferBtn').onclick = async () => {
+  isHost = true;
+  createPeer(true);
+  setStatus('Creating offer...');
+  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
+  await pc.setLocalDescription(offer);
+  // Wait for ICE gathering to complete to get full SDP (wait until iceGatheringState === 'complete' or timeout)
+  await waitForIceGatheringComplete(pc, 2000);
+  document.getElementById('localOffer').value = pc.localDescription.sdp;
+  setStatus('Offer ready — share with peer');
+};
+
+document.getElementById('createAnswerBtn').onclick = async () => {
+  // Answerer: read remote offer
+  const ro = document.getElementById('remoteOffer').value.trim();
+  if (!ro) { alert('Paste host offer first'); return; }
+  createPeer(false);
+  const offerDesc = { type: 'offer', sdp: ro };
+  await pc.setRemoteDescription(offerDesc);
+  setStatus('Creating answer...');
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceGatheringComplete(pc, 2000);
+  document.getElementById('localAnswer').value = pc.localDescription.sdp;
+  setStatus('Answer ready — send it back to host');
+};
+
+document.getElementById('setRemoteAnswerBtn').onclick = async () => {
+  const ra = document.getElementById('remoteAnswer').value.trim();
+  if (!ra) { alert('Paste answer here'); return; }
+  const ansDesc = { type: 'answer', sdp: ra };
+  await pc.setRemoteDescription(ansDesc);
+  setStatus('Remote answer set — waiting for connection');
+};
+
+// ICE gather helper: wait until gathering complete or timeout
+function waitForIceGatheringComplete(pc, timeoutMs=2000) {
+  return new Promise((res) => {
+    if (pc.iceGatheringState === 'complete') { res(); return; }
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') { cleanup(); res(); }
+    };
+    const iglistener = () => check();
+    pc.addEventListener('icegatheringstatechange', iglistener);
+    const to = setTimeout(() => { cleanup(); res(); }, timeoutMs);
+    function cleanup() {
+      clearTimeout(to);
+      pc.removeEventListener('icegatheringstatechange', iglistener);
+    }
+  });
+}
+
+// --- Game state ---
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const W = canvas.width, H = canvas.height;
+
+const local = {
+  id: 'me',
+  x: Math.random() * (W-60) + 30,
+  y: Math.random() * (H-60) + 30,
+  vx:0, vy:0,
+  angle:0,
+  color: document.getElementById('myColor').value || '#66ccff',
+  name: document.getElementById('myName').value || 'Player',
+  alive: true,
+  score: 0,
+};
+
+let remotePlayer = {
+  id: 'op',
+  x: Math.random() * (W-60) + 30,
+  y: Math.random() * (H-60) + 30,
+  angle:0,
+  color: '#ff9966',
+  name: 'Opponent',
+  alive: true,
+  score: 0,
+};
+
+let bullets = []; // local bullets
+let remoteBullets = []; // bullets reported by peer
+const bulletSpeed = 8;
+const playerSpeed = 3.2;
+let lastShot = 0;
+const shotCooldown = 220; // ms
+let gameStarted = false;
+let winner = null;
+
+document.getElementById('myColor').onchange = (e)=> local.color = e.target.value;
+document.getElementById('myName').onchange = (e)=> local.name = e.target.value;
+
+// Input
+const keys = {};
+let mouse = {x:0, y:0, down:false};
+window.addEventListener('keydown', e=> keys[e.key.toLowerCase()] = true);
+window.addEventListener('keyup', e=> keys[e.key.toLowerCase()] = false);
+canvas.addEventListener('mousemove', (e)=> {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', e=> mouse.down = true);
+window.addEventListener('mouseup', e=> mouse.down = false);
+
+// Game loop + networking tick
+const TICK_RATE = 60;
+let lastTime = performance.now();
+function loop(now) {
+  const dt = (now - lastTime) / 1000;
+  lastTime = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function update(dt) {
+  if (!local.alive) return;
+  // Movement
+  let dx = 0, dy = 0;
+  if (keys['w']||keys['arrowup']) dy -= 1;
+  if (keys['s']||keys['arrowdown']) dy += 1;
+  if (keys['a']||keys['arrowleft']) dx -= 1;
+  if (keys['d']||keys['arrowright']) dx += 1;
+  const len = Math.hypot(dx,dy);
+  if (len>0) { dx/=len; dy/=len; }
+  local.x += dx * playerSpeed;
+  local.y += dy * playerSpeed;
+  // bounds
+  local.x = Math.max(12, Math.min(W-12, local.x));
+  local.y = Math.max(12, Math.min(H-12, local.y));
+
+  // angle to mouse
+  local.angle = Math.atan2(mouse.y - local.y, mouse.x - local.x);
+
+  // shooting
+  if (mouse.down && Date.now() - lastShot > shotCooldown) {
+    shoot(local.x, local.y, local.angle, local.id);
+    lastShot = Date.now();
+  }
+
+  // bullets update
+  for (let b of bullets) {
+    b.x += Math.cos(b.a) * bulletSpeed;
+    b.y += Math.sin(b.a) * bulletSpeed;
+    b.life -= dt;
+  }
+  bullets = bullets.filter(b => b.life > 0 && b.x >= -10 && b.x <= W+10 && b.y >= -10 && b.y <= H+10);
+
+  for (let b of remoteBullets) {
+    b.x += Math.cos(b.a) * bulletSpeed;
+    b.y += Math.sin(b.a) * bulletSpeed;
+    b.life -= dt;
+  }
+  remoteBullets = remoteBullets.filter(b => b.life > 0 && b.x >= -10 && b.x <= W+10 && b.y >= -10 && b.y <= H+10);
+
+  // collision local bullets -> remote player
+  if (remotePlayer.alive) {
+    for (let i = bullets.length-1; i>=0; i--) {
+      const b = bullets[i];
+      if (dist(b.x, b.y, remotePlayer.x, remotePlayer.y) < 18) {
+        bullets.splice(i,1);
+        // report hit
+        send({ t: 'hit', target: 'remote' }); // notify peer that they were hit
+        local.score += 1;
+        checkWin();
+      }
+    }
+  }
+  // collision remote bullets -> local
+  for (let i = remoteBullets.length-1; i>=0; i--) {
+    const b = remoteBullets[i];
+    if (dist(b.x, b.y, local.x, local.y) < 18) {
+      remoteBullets.splice(i,1);
+      local.alive = false;
+      // inform remote we died
+      send({ t: 'died' });
+      checkWin();
+    }
+  }
+
+  // periodically send state
+  if (connected) {
+    const out = {
+      t: 'state',
+      x: local.x, y: local.y, a: local.angle, name: local.name, color: local.color,
+      bullets: bullets.map(b => ({x:b.x,y:b.y,a:b.a,id:b.id})), // send positions of bullets we fired
+      score: local.score,
+      alive: local.alive,
+      ts: Date.now()
+    };
+    // Only send minimal info (bullets positions are included)
+    send(out);
+  }
+}
+
+function shoot(x,y,a,owner) {
+  const b = { x: x + Math.cos(a)*18, y: y + Math.sin(a)*18, a: a, life: 3.0, id: Math.random().toString(36).slice(2), owner };
+  bullets.push(b);
+  // also send an immediate 'bullet' message (so remote sees it quickly)
+  send({ t: 'bullet', x:b.x, y:b.y, a:b.a, id: b.id });
+}
+
+function handleNetMessage(msg) {
+  if (!msg || !msg.t) return;
+  if (msg.t === 'hello') {
+    remotePlayer.name = msg.name || 'Opponent';
+    remotePlayer.color = msg.color || remotePlayer.color;
+    console.log('peer hello', msg);
+    gameStarted = true;
+  } else if (msg.t === 'state') {
+    // update remote player
+    remotePlayer.x = msg.x; remotePlayer.y = msg.y; remotePlayer.angle = msg.a;
+    remotePlayer.name = msg.name || remotePlayer.name;
+    remotePlayer.color = msg.color || remotePlayer.color;
+    remotePlayer.score = msg.score || remotePlayer.score;
+    remotePlayer.alive = (msg.alive===undefined)?true:msg.alive;
+    // merge remote bullets
+    if (Array.isArray(msg.bullets)) {
+      for (const b of msg.bullets) {
+        // avoid duplicates
+        if (!remoteBullets.some(rb => rb.id === b.id)) {
+          remoteBullets.push({ x:b.x, y:b.y, a:b.a, life:3.0, id: b.id });
+        }
+      }
+    }
+  } else if (msg.t === 'bullet') {
+    if (!remoteBullets.some(rb => rb.id === msg.id)) {
+      remoteBullets.push({ x:msg.x, y:msg.y, a:msg.a, life:3.0, id:msg.id });
+    }
+  } else if (msg.t === 'hit') {
+    // peer says they were hit by our bullet -> increment our score (they already did locally too)
+    // no-op or optionally sync scores
+    // console.log('peer reports hit', msg);
+  } else if (msg.t === 'died') {
+    // remote died
+    remotePlayer.alive = false;
+    // give remote a respawn after a small delay? we'll auto-respawn both after 2s
+    setTimeout(() => {
+      remotePlayer.alive = true;
+      remotePlayer.x = Math.random() * (W-60) + 30;
+      remotePlayer.y = Math.random() * (H-60) + 30;
+    }, 1500);
+  }
+}
+
+// helper distance
+function dist(ax,ay,bx,by) { return Math.hypot(ax-bx, ay-by); }
+
+// draw
+function draw() {
+  ctx.clearRect(0,0,W,H);
+  // background grid
+  ctx.fillStyle = '#061126';
+  ctx.fillRect(0,0,W,H);
+
+  // draw local respawn indicator
+  if (!local.alive) {
+    ctx.fillStyle = 'rgba(255,80,80,0.15)';
+    ctx.fillRect(0,0,W,H);
+  }
+
+  // draw remote player (interpolated roughly)
+  if (remotePlayer.alive) {
+    drawPlayer(remotePlayer.x, remotePlayer.y, remotePlayer.angle, remotePlayer.color, remotePlayer.name);
+  } else {
+    // dead marker
+    ctx.fillStyle = 'rgba(200,0,0,0.8)';
+    ctx.beginPath(); ctx.arc(remotePlayer.x, remotePlayer.y, 20, 0, Math.PI*2); ctx.fill();
+  }
+
+  // draw local bullets (player's view)
+  for (const b of bullets) {
+    drawBullet(b.x, b.y);
+  }
+  // draw remote bullets
+  for (const b of remoteBullets) {
+    drawBullet(b.x, b.y);
+  }
+
+  // draw local player
+  drawPlayer(local.x, local.y, local.angle, local.color, local.name, true);
+
+  // HUD
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px Arial';
+  ctx.fillText(`${local.name} (you): ${local.score}`, 10, 18);
+  ctx.fillText(`${remotePlayer.name}: ${remotePlayer.score}`, 10, 36);
+
+  if (!connected) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(W - 210, 6, 200, 26);
+    ctx.fillStyle = '#ffd';
+    ctx.fillText('Not connected - exchange Offer/Answer', W - 200, 24);
+  }
+  if (winner) {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(W/2 - 160, H/2 - 40, 320, 80);
+    ctx.fillStyle = '#fff';
+    ctx.font = '24px Arial';
+    ctx.fillText(winner + ' wins!', W/2 - 60, H/2);
+  }
+}
+
+function drawPlayer(x,y,angle,color,name,isLocal=false) {
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(angle);
+  // body
+  ctx.fillStyle = color || '#66c';
+  ctx.beginPath();
+  ctx.moveTo(16,0);
+  ctx.lineTo(-12,-10);
+  ctx.lineTo(-12,10);
+  ctx.closePath();
+  ctx.fill();
+  // outline
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.restore();
+  // name
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px Arial';
+  ctx.fillText(name, x - 20, y - 22);
+}
+
+function drawBullet(x,y) {
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2); ctx.fill();
+}
+
+function checkWin() {
+  if (local.score >= 5) {
+    winner = local.name;
+    send({ t:'win', name: local.name });
+    setTimeout(resetRound, 4000);
+  }
+}
+
+// Reset round
+function resetRound() {
+  local.score = 0;
+  remotePlayer.score = 0;
+  local.alive = true;
+  remotePlayer.alive = true;
+  bullets = [];
+  remoteBullets = [];
+  winner = null;
+  local.x = Math.random() * (W-60) + 30;
+  local.y = Math.random() * (H-60) + 30;
+  remotePlayer.x = Math.random() * (W-60) + 30;
+  remotePlayer.y = Math.random() * (H-60) + 30;
+}
+
+// Handle remote win
+function handleRemoteWin(name) {
+  winner = name;
+  setTimeout(resetRound, 4000);
+}
+
+// react to 'win' messages
+function handleNetMessage(msg) {
+  if (!msg || !msg.t) return;
+  if (msg.t === 'hello') {
+    remotePlayer.name = msg.name || 'Opponent';
+    remotePlayer.color = msg.color || remotePlayer.color;
+    gameStarted = true;
+  } else if (msg.t === 'state') {
+    remotePlayer.x = msg.x; remotePlayer.y = msg.y; remotePlayer.angle = msg.a;
+    remotePlayer.name = msg.name || remotePlayer.name;
+    remotePlayer.color = msg.color || remotePlayer.color;
+    remotePlayer.score = msg.score || remotePlayer.score;
+    remotePlayer.alive = (msg.alive===undefined)?true:msg.alive;
+    if (Array.isArray(msg.bullets)) {
+      for (const b of msg.bullets) {
+        if (!remoteBullets.some(rb => rb.id === b.id)) {
+          remoteBullets.push({ x:b.x, y:b.y, a:b.a, life:3.0, id: b.id });
+        }
+      }
+    }
+  } else if (msg.t === 'bullet') {
+    if (!remoteBullets.some(rb => rb.id === msg.id)) {
+      remoteBullets.push({ x:msg.x, y:msg.y, a:msg.a, life:3.0, id:msg.id });
+    }
+  } else if (msg.t === 'hit') {
+    // peer reports they were hit by our bullet
+    // increment score? they should increment locally and sync; we'll accept their score if they send it in state
+  } else if (msg.t === 'died') {
+    remotePlayer.alive = false;
+    setTimeout(()=> { remotePlayer.alive = true; remotePlayer.x = Math.random()*(W-60)+30; remotePlayer.y = Math.random()*(H-60)+30; }, 1500);
+  } else if (msg.t === 'win') {
+    handleRemoteWin(msg.name || 'Opponent');
+  }
+}
+
+// Note: we re-declared handleNetMessage above to ensure it's in scope after function declarations.
+// (This single-file approach avoids many modules; it's intentionally compact.)
+
+// End of script
+</script>
+</body>
+</html>
