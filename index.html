@@ -62,7 +62,10 @@ let isHost = false;
 let connected = false;
 
 const createPeer = (makeDataChannel) => {
-  pc = new RTCPeerConnection();
+  pc = new RTCPeerConnection({
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+});
+
 
   pc.onicecandidate = (e) => {
     // ICE candidates are embedded in SDP automatically for modern browsers (trickle disabled here).
@@ -527,3 +530,4 @@ function handleNetMessage(msg) {
 </script>
 </body>
 </html>
+
